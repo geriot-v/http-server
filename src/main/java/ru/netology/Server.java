@@ -1,12 +1,13 @@
 package ru.netology;
 
+import org.apache.hc.core5.net.URIBuilder;
+
 import java.io.*;
 import java.net.*;
 import java.nio.file.*;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.nio.charset.StandardCharsets;
 
 public class Server {
@@ -29,7 +30,13 @@ public class Server {
             System.out.println("Сервер запущен на порту " + port);
             while (true) {
                 Socket socket = serverSocket.accept();
-                executor.submit(() -> handleConnection(socket));
+                executor.submit(() -> {
+                    try {
+                        handleConnection(socket);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
             }
         } catch (IOException e) {
             System.err.println("Ошибка при запуске сервера: " + e.getMessage());
@@ -38,11 +45,14 @@ public class Server {
         }
     }
 
-    private void handleConnection(Socket socket) {
-        try (
-                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-                BufferedOutputStream out = new BufferedOutputStream(socket.getOutputStream())
-        ) {
+    private void handleConnection(Socket socket) throws IOException {
+        BufferedReader in = null;
+        BufferedOutputStream out = null;
+
+        try {
+            in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            out = new BufferedOutputStream(socket.getOutputStream());
+
             String requestLine = in.readLine();
             if (requestLine == null || requestLine.isBlank()) {
                 sendBadRequest(out);
@@ -56,7 +66,7 @@ public class Server {
             }
 
             String method = parts[0];
-            String path = parts[1];
+            String rawUri = parts[1];
 
             Map<String, String> headers = new HashMap<>();
             String line;
@@ -84,21 +94,32 @@ public class Server {
                 bodyStream = new ByteArrayInputStream(new byte[0]);
             }
 
+            Request request = new Request(method, rawUri, headers, bodyStream);
+
             Handler handler = Optional.ofNullable(handlers.get(method))
-                    .map(map -> map.get(path))
+                    .map(map -> map.get(request.getPath()))
                     .orElse(null);
 
             if (handler != null) {
-                Request request = new Request(method, path, headers, bodyStream);
                 handler.handle(request, out);
             } else {
-                serveStaticFile(path, out);
+                serveStaticFile(request.getPath(), out);
             }
 
+        } catch (URISyntaxException e) {
+            System.err.println("Неверный формат URI: " + e.getMessage());
+            sendBadRequest(out);
         } catch (IOException e) {
             System.err.println("Ошибка при обработке подключения: " + e.getMessage());
         } finally {
             try {
+                if (out != null) {
+                    out.flush();
+                    out.close();
+                }
+                if (in != null) {
+                    in.close();
+                }
                 socket.close();
             } catch (IOException ignored) {}
         }
@@ -131,7 +152,6 @@ public class Server {
 
             out.write(header.getBytes(StandardCharsets.UTF_8));
             out.write(bytes);
-            out.flush();
         } else {
             String mimeType = Files.probeContentType(filePath);
             long length = Files.size(filePath);
@@ -144,7 +164,6 @@ public class Server {
 
             out.write(header.getBytes(StandardCharsets.UTF_8));
             Files.copy(filePath, out);
-            out.flush();
         }
     }
 
@@ -155,7 +174,6 @@ public class Server {
                 "Connection: close\r\n" +
                 "\r\n";
         out.write(response.getBytes(StandardCharsets.UTF_8));
-        out.flush();
     }
 
     private void sendBadRequest(BufferedOutputStream out) throws IOException {
@@ -171,6 +189,7 @@ public class Server {
         executor.shutdown();
     }
 
+    // Вспомогательный класс для ограничения чтения тела запроса
     static class LimitInputStream extends InputStream {
         private final InputStream source;
         private int remaining;
